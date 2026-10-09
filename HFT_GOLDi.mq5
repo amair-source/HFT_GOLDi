@@ -19,7 +19,7 @@ input double          InpRsiHi    = 70.0;
 input int             InpTrendEma = 50;
 input int             InpAtrPeriod = 14;
 input double InpSL_Atr   = 2.0;
-input double InpTP_Atr   = 2.25;
+input double InpTP_Atr   = 4.0;
 
 input group "=== Risk & blow-up protection ==="
 input double InpRiskPercent         = 10.0;
@@ -51,6 +51,9 @@ input double InpRsiDnFilter       = 30.0;  // short entry only when RSI7 above t
 input bool   InpSlopeFilter       = true;  // long only when EMA50 rising, short only when falling
 input bool   InpZoneFilter        = true;  // enter only near EMA50 (pullback zone, not extended)
 input double InpZoneAtr           = 0.4;   // max |close-EMA50| in ATR units for an entry
+input bool   InpAtrFloorFilter    = true;  // skip entries when ATR is below its recent median (avoid chop)
+input int    InpAtrFloorBars      = 50;    // bars used for the ATR median
+input double InpAtrFloorRatio     = 1.0;   // ATR must be >= this * median ATR
 input int    InpMagic             = 234001;
 input int    InpSlippage          = 30;
 input bool   InpResetProtection   = false;
@@ -60,6 +63,7 @@ input bool   InpMartingale   = true;    // add a leg when price moves $InpMartSt
 input double InpMartStepUsd  = 1.5;
 input double InpMartLot      = 0.01;
 input double InpLastLegLot   = 0.02;   // lot size of the final (max-leg) trade
+input double InpLastLegLossUsd = 5.0;  // open the final leg once basket floats -$X
 input int    InpMaxMartPos   = 3;
 
 CTrade trade;
@@ -128,7 +132,7 @@ int OnInit()
    dayStamp = TimeToString(TimeCurrent(), TIME_DATE);
    dayHalted = false;
 
-   PrintFormat("HFT_GOLDi v1.14 init: base=%.2f equity=%.2f halted=%s target=%.1fx",
+   PrintFormat("HFT_GOLDi v1.17 init: base=%.2f equity=%.2f halted=%s target=%.1fx",
                gBase, dayStartEquity, permHalted ? "YES" : "no", InpTargetMultiple);
    return(INIT_SUCCEEDED);
 }
@@ -328,6 +332,23 @@ void EveryCandle()
       { gStatus = StringFormat("hold out: %.2f ATR below EMA50", -dist / atr); return; }
    }
 
+   if(InpAtrFloorFilter)
+   {
+      int need = MathMax(InpAtrFloorBars, 5);
+      double atrHist[];
+      if(CopyBuffer(hAtr, 0, 1, need, atrHist) < need)
+      { gStatus = "skip: no ATR history"; return; }
+      double sorted[];
+      ArrayResize(sorted, need);
+      for(int k = 0; k < need; k++) sorted[k] = atrHist[k];
+      ArraySort(sorted);
+      double med = (need % 2 == 1) ? sorted[need / 2]
+                                   : 0.5 * (sorted[need / 2 - 1] + sorted[need / 2]);
+      if(atr < InpAtrFloorRatio * med)
+      { gStatus = StringFormat("hold out: ATR %.2f < %.2f x median %.2f (chop)",
+                               atr, InpAtrFloorRatio, med); return; }
+   }
+
    double slDist = MathMax(MathRound(InpSL_Atr * atr / gPoint), 1) * gPoint;
    double tpDist = MathMax(MathRound(InpTP_Atr * atr / gPoint), 1) * gPoint;
 
@@ -363,7 +384,7 @@ void CheckMartingale()
       int want = (grp == 0) ? 1 : -1;
       int n = 0, total = 0;
       ulong firstTicket = ULONG_MAX;
-      double firstEntry = 0, firstSL = 0, firstTP = 0;
+      double firstEntry = 0, firstSL = 0, firstTP = 0, floatPl = 0;
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong ticket = PositionGetTicket(i);
@@ -374,6 +395,7 @@ void CheckMartingale()
          int s = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
          if(s != want) continue;
          n++;
+         floatPl += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
          if(ticket < firstTicket)
          {
             firstTicket = ticket;
@@ -385,15 +407,25 @@ void CheckMartingale()
       if(n == 0) continue;
       if(total >= InpMaxMartPos) return;   // shared pool full (manual + EA, max 3)
 
-      // add one leg every $InpMartStepUsd against this side's FIRST entry
-      bool add = (want == 1) ? (tick.bid <= firstEntry - InpMartStepUsd * n)
-                             : (tick.ask >= firstEntry + InpMartStepUsd * n);
+      // leg 2 opens on the $InpMartStepUsd price step;
+      // the FINAL leg opens once the basket floats -$InpLastLegLossUsd
+      bool isLast = (n + 1 >= InpMaxMartPos);
+      bool add;
+      if(isLast)
+         add = (floatPl <= -InpLastLegLossUsd);
+      else
+         add = (want == 1) ? (tick.bid <= firstEntry - InpMartStepUsd * n)
+                           : (tick.ask >= firstEntry + InpMartStepUsd * n);
       if(!add)
       {
-         gStatus = StringFormat("%s basket %d/%d legs (next add @ %.2f)",
-                                want == 1 ? "long" : "short", n, InpMaxMartPos,
-                                want == 1 ? firstEntry - InpMartStepUsd * n
-                                          : firstEntry + InpMartStepUsd * n);
+         gStatus = isLast
+                   ? StringFormat("%s basket %d/%d (last leg at -$%.2f, now $%.2f)",
+                                  want == 1 ? "long" : "short", n, InpMaxMartPos,
+                                  InpLastLegLossUsd, floatPl)
+                   : StringFormat("%s basket %d/%d legs (next add @ %.2f)",
+                                  want == 1 ? "long" : "short", n, InpMaxMartPos,
+                                  want == 1 ? firstEntry - InpMartStepUsd * n
+                                            : firstEntry + InpMartStepUsd * n);
          continue;
       }
 
@@ -500,7 +532,8 @@ void ManagePositions()
    {
       int want = (grp == 0) ? 1 : -1;
       int n = 0;
-      double totVol = 0, sumWe = 0;
+      double totVol = 0, sumWe = 0, lastEntry = 0;
+      ulong lastTicket = 0;
       ulong tickets[];
       double sls[], tps[];
       long types[];
@@ -513,8 +546,10 @@ void ManagePositions()
          int s = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
          if(s != want) continue;
          double v = PositionGetDouble(POSITION_VOLUME);
+         double op = PositionGetDouble(POSITION_PRICE_OPEN);
          totVol += v;
-         sumWe += PositionGetDouble(POSITION_PRICE_OPEN) * v;
+         sumWe += op * v;
+         if(ticket > lastTicket) { lastTicket = ticket; lastEntry = op; }
          ArrayResize(tickets, n + 1);
          ArrayResize(sls, n + 1);
          ArrayResize(tps, n + 1);
@@ -541,7 +576,19 @@ void ManagePositions()
          double sl = sls[i], tp = tps[i];
          long type = types[i];
          double ns = sl;
-         if(buffer > 0)
+         if(n >= 2)
+         {
+            // averaged basket: fix the stop at the LAST leg's entry (never beyond it)
+            if(type == POSITION_TYPE_BUY)
+            {
+               if(lastEntry > sl + gPoint / 2.0) ns = lastEntry;
+            }
+            else
+            {
+               if(sl == 0 || lastEntry < sl - gPoint / 2.0) ns = lastEntry;
+            }
+         }
+         else if(buffer > 0)
          {
             if(type == POSITION_TYPE_BUY)
             {
@@ -568,8 +615,9 @@ void ManagePositions()
             (type == POSITION_TYPE_SELL && (sl == 0 || ns < sl - gPoint / 2.0)))
             trade.PositionModify(tickets[i], NormalizeDouble(ns, gDigits), tp);
       }
-      gStatus = StringFormat("trailing %s basket %d leg(s) net $%.2f buffer %.2f",
-                             want == 1 ? "long" : "short", n, netUsd, buffer);
+      gStatus = StringFormat("trailing %s basket %d leg(s) net $%.2f (SL @ %.2f)",
+                             want == 1 ? "long" : "short", n, netUsd,
+                             (n >= 2 ? lastEntry : (want == 1 ? tick.bid - buffer : tick.ask + buffer)));
    }
 }
 
@@ -710,6 +758,6 @@ void UpdateComment(double eq)
 {
    double pct = gBase > 0 ? eq / gBase * 100.0 : 0;
    string state = permHalted ? "HALTED (target/drawdown)" : (dayHalted ? "PAUSED (daily limit)" : "ACTIVE");
-   Comment(StringFormat("HFT_GOLDi v1.14 | base %.2f | equity %.2f | %.0f%% of %.0fx | %s\n%s",
+   Comment(StringFormat("HFT_GOLDi v1.17 | base %.2f | equity %.2f | %.0f%% of %.0fx | %s\n%s",
                         gBase, eq, pct, InpTargetMultiple, state, gStatus));
 }
