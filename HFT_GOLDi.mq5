@@ -26,7 +26,7 @@ input double InpRiskPercent         = 10.0;
 input double InpMaxEffectiveRiskPct = 30.0;
 input double InpShrinkMinAtr        = 2.0;
 input int    InpMaxPositions        = 1;
-input double InpMaxDailyLossPct     = 20.0;
+input double InpMaxDailyLossPct     = 45.0;
 input double InpMaxDrawdownPct      = 55.0;
 input double InpTargetMultiple      = 10.0;
 input int    InpMaxSpreadPts        = 45;
@@ -37,7 +37,7 @@ input int InpEndHour   = 20;
 
 input group "=== Trade management ==="
 input bool   InpTrailing          = true;
-input double InpBeAtr             = 0.5;
+input double InpBeAtr             = 1.0;
 input double InpTrailAtr          = 1.5;
 input double InpTrailBufferPts    = 200;   // trailing buffer in symbol points (0 = ATR chandelier)
 input int    InpHighSpreadPts     = 30;    // spread (pts) above which the wider buffer is used
@@ -54,20 +54,23 @@ input double InpZoneAtr           = 0.4;   // max |close-EMA50| in ATR units for
 input bool   InpAtrFloorFilter    = true;  // skip entries when ATR is below its recent median (avoid chop)
 input int    InpAtrFloorBars      = 50;    // bars used for the ATR median
 input double InpAtrFloorRatio     = 1.0;   // ATR must be >= this * median ATR
+input bool   InpBiasFilter        = true;  // trade only with higher-timeframe trend (directional bias)
+input ENUM_TIMEFRAMES InpBiasTf   = PERIOD_H1;  // bias timeframe
+input int    InpBiasPeriod        = 20;    // bias EMA period
 input int    InpMagic             = 234001;
 input int    InpSlippage          = 30;
 input bool   InpResetProtection   = false;
 
 input group "=== Martingale (add-on) ==="
 input bool   InpMartingale   = true;    // add a leg when price moves $InpMartStepUsd against the last leg
-input double InpMartStepUsd  = 1.5;
+input double InpMartStepUsd  = 2.5;
 input double InpMartLot      = 0.01;
 input double InpLastLegLot   = 0.02;   // lot size of the final (max-leg) trade
-input double InpLastLegLossUsd = 5.0;  // open the final leg once basket floats -$X
+input double InpLastLegLossUsd = 8.0;  // open the final leg once basket floats -$X
 input int    InpMaxMartPos   = 3;
 
 CTrade trade;
-int    hRsi = INVALID_HANDLE, hTrend = INVALID_HANDLE, hAtr = INVALID_HANDLE;
+int    hRsi = INVALID_HANDLE, hTrend = INVALID_HANDLE, hAtr = INVALID_HANDLE, hBias = INVALID_HANDLE;
 datetime lastBar = 0;
 string   gvBase = "", gvHalt = "";
 double   gBase = 0, dayStartEquity = 0;
@@ -103,7 +106,8 @@ int OnInit()
    hRsi   = iRSI(gSymbol, InpTf, InpRsiPeriod, PRICE_CLOSE);
    hTrend = iMA(gSymbol, InpTf, InpTrendEma, 0, MODE_EMA, PRICE_CLOSE);
    hAtr   = iATR(gSymbol, InpTf, InpAtrPeriod);
-   if(hRsi == INVALID_HANDLE || hTrend == INVALID_HANDLE || hAtr == INVALID_HANDLE)
+   hBias  = iMA(gSymbol, InpBiasTf, InpBiasPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(hRsi == INVALID_HANDLE || hTrend == INVALID_HANDLE || hAtr == INVALID_HANDLE || hBias == INVALID_HANDLE)
    { Print("Indicator creation failed: ", GetLastError()); return(INIT_FAILED); }
 
    trade.SetExpertMagicNumber(InpMagic);
@@ -132,7 +136,7 @@ int OnInit()
    dayStamp = TimeToString(TimeCurrent(), TIME_DATE);
    dayHalted = false;
 
-   PrintFormat("HFT_GOLDi v1.17 init: base=%.2f equity=%.2f halted=%s target=%.1fx",
+   PrintFormat("HFT_GOLDi v1.19 init: base=%.2f equity=%.2f halted=%s target=%.1fx",
                gBase, dayStartEquity, permHalted ? "YES" : "no", InpTargetMultiple);
    return(INIT_SUCCEEDED);
 }
@@ -142,6 +146,7 @@ void OnDeinit(const int reason)
    IndicatorRelease(hRsi);
    IndicatorRelease(hTrend);
    IndicatorRelease(hAtr);
+   IndicatorRelease(hBias);
    Comment("");
 }
 
@@ -349,6 +354,17 @@ void EveryCandle()
                                atr, InpAtrFloorRatio, med); return; }
    }
 
+   if(InpBiasFilter)
+   {
+      double biasArr[], clB[];
+      if(CopyBuffer(hBias, 0, 0, 1, biasArr) < 1) { gStatus = "skip: no bias EMA"; return; }
+      if(CopyClose(gSymbol, InpBiasTf, 0, 1, clB) < 1) { gStatus = "skip: no bias close"; return; }
+      if(dir == 1 && clB[0] <= biasArr[0])
+      { gStatus = StringFormat("hold out: bias %s down", EnumToString(InpBiasTf)); return; }
+      if(dir == -1 && clB[0] >= biasArr[0])
+      { gStatus = StringFormat("hold out: bias %s up", EnumToString(InpBiasTf)); return; }
+   }
+
    double slDist = MathMax(MathRound(InpSL_Atr * atr / gPoint), 1) * gPoint;
    double tpDist = MathMax(MathRound(InpTP_Atr * atr / gPoint), 1) * gPoint;
 
@@ -523,9 +539,6 @@ void ManagePositions()
    }
 
    if(!InpTrailing) return;
-   double bufferPts = ((tick.ask - tick.bid) / gPoint > InpHighSpreadPts)
-                      ? InpTrailBufferHiPts : InpTrailBufferPts;
-   double buffer = bufferPts * gPoint;
 
    // per-side baskets: each side trailed against its own weighted average entry
    for(int grp = 0; grp < 2; grp++)
@@ -588,28 +601,34 @@ void ManagePositions()
                if(sl == 0 || lastEntry < sl - gPoint / 2.0) ns = lastEntry;
             }
          }
-         else if(buffer > 0)
-         {
-            if(type == POSITION_TYPE_BUY)
-            {
-               double trail = tick.bid - buffer;
-               if(trail < avgEntry) trail = avgEntry;
-               if(trail > sl + gPoint / 2.0) ns = trail;
-            }
-            else
-            {
-               double trail = tick.ask + buffer;
-               if(trail > avgEntry) trail = avgEntry;
-               if(sl == 0 || trail < sl - gPoint / 2.0) ns = trail;
-            }
-         }
-         else if(type == POSITION_TYPE_BUY)
-         {
-            if(avgEntry > sl + gPoint / 2.0) ns = avgEntry;
-         }
          else
          {
-            if(sl == 0 || avgEntry < sl - gPoint / 2.0) ns = avgEntry;
+            // single position: ATR chandelier trail (lock break-even, then trail 1.5xATR)
+            double prof = (type == POSITION_TYPE_BUY) ? (tick.bid - avgEntry) : (avgEntry - tick.ask);
+            if(prof >= InpBeAtr * atr)
+            {
+               if(type == POSITION_TYPE_BUY)
+               {
+                  if(avgEntry > sl + gPoint / 2.0) ns = avgEntry;
+               }
+               else
+               {
+                  if(sl == 0 || avgEntry < sl - gPoint / 2.0) ns = avgEntry;
+               }
+            }
+            if(prof >= InpTrailAtr * atr)
+            {
+               if(type == POSITION_TYPE_BUY)
+               {
+                  double tr = tick.bid - InpTrailAtr * atr;
+                  if(tr > ns + gPoint / 2.0) ns = tr;
+               }
+               else
+               {
+                  double tr = tick.ask + InpTrailAtr * atr;
+                  if(ns == 0 || tr < ns - gPoint / 2.0) ns = tr;
+               }
+            }
          }
          if((type == POSITION_TYPE_BUY && ns > sl + gPoint / 2.0) ||
             (type == POSITION_TYPE_SELL && (sl == 0 || ns < sl - gPoint / 2.0)))
@@ -617,7 +636,8 @@ void ManagePositions()
       }
       gStatus = StringFormat("trailing %s basket %d leg(s) net $%.2f (SL @ %.2f)",
                              want == 1 ? "long" : "short", n, netUsd,
-                             (n >= 2 ? lastEntry : (want == 1 ? tick.bid - buffer : tick.ask + buffer)));
+                             (n >= 2 ? lastEntry :
+                              (want == 1 ? tick.bid - InpTrailAtr * atr : tick.ask + InpTrailAtr * atr)));
    }
 }
 
@@ -758,6 +778,6 @@ void UpdateComment(double eq)
 {
    double pct = gBase > 0 ? eq / gBase * 100.0 : 0;
    string state = permHalted ? "HALTED (target/drawdown)" : (dayHalted ? "PAUSED (daily limit)" : "ACTIVE");
-   Comment(StringFormat("HFT_GOLDi v1.17 | base %.2f | equity %.2f | %.0f%% of %.0fx | %s\n%s",
+   Comment(StringFormat("HFT_GOLDi v1.19 | base %.2f | equity %.2f | %.0f%% of %.0fx | %s\n%s",
                         gBase, eq, pct, InpTargetMultiple, state, gStatus));
 }
